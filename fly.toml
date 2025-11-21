@@ -1,23 +1,27 @@
 app = "lda-bot"
-primary_region = "iad"         # or your closest region
+primary_region = "iad"
 
 [build]
   dockerfile = "Dockerfile"
 
-# Persistent SQLite database
 [mounts]
   source      = "filings_db"   # created with `fly volumes create`
   destination = "/app/data"
 
-# Environment – credentials are added later with `fly secrets set`
 [env]
   DATABASE_PATH = "/app/data/filings.db"
 
-# Each entry becomes its own process group (and therefore its own Machine)
-[processes]
-  app  = "bash -c 'python lda_bot.py update'"
-
-# VM defaults (feel free to adjust)
-[[vm]]
-  size      = "shared-cpu-1x"
+# Keep at least one machine running for 'app'
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
   processes = ['app']
+
+[[vm]]
+  # dedicated machine for long-running `app` process
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

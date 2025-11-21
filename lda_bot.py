@@ -4,169 +4,182 @@ from pathlib import Path
 from dotenv import load_dotenv
 from flask import Flask 
 from slackeventsapi import SlackEventAdapter
-import os
-import sys    
-import json
-from fetch import fetch_all_filings, fetch_filing
-from extract import get_uuid, get_filing_year, get_filing_document_url, get_filing_period, get_registrant_name, get_client_name, get_income, get_expenses, get_lobbying_descriptions, get_lobbyist_names
+import os 
+from fetch import fetch_all_filings, fetch_filing, fetch_quarter, THIS_YEAR
+from slack_sdk import WebClient
+from slackeventsapi import SlackEventAdapter
+from dotenv import load_dotenv
+from pathlib import Path as _Path
+from flask import request, jsonify, Flask as _Flask
+import requests
+import io, csv
+from re import sub 
 from datetime import date
-from post import post_slack
+from db_actions import update_db, initialize_db 
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 DB_PATH = os.getenv("DATABASE_PATH", "/app/data/filings.db")
 
+# Slack app setup (used for app_mention handler)
+env_path = _Path('.') / '.env'
+load_dotenv(dotenv_path=env_path)
+app = _Flask(__name__)
+slack_event_adapter = SlackEventAdapter(os.environ.get('SIGNING_SECRET', ''), '/slack/events', app)
+client = WebClient(token=os.environ.get('SLACK_TOKEN'))
+SLACK_CHANNEL = os.getenv('SLACK_CHANNEL', '#lda-filings')
 
-def main():
-    if not Path("/app/data").is_dir():
-        raise RuntimeError(
-            "/app/data volume is not mounted – aborting."
-        )
-    
-    # Create database if it doesn't exist
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    with conn: 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS filings (
-                filing_uuid TEXT PRIMARY KEY,
-                filing_document_url TEXT,
-                filing_year INTEGER,
-                filing_period TEXT, 
-                registrant_name TEXT,
-                client_name TEXT,
-                income REAL,
-                expenses REAL,
-                lobbying_descriptions TEXT,
-                lobbyist_names TEXT
-            )
-        """)
 
-    if len(sys.argv) > 1 and sys.argv[1] == "update":
-        print("Running update function")
-        update_db()
-    
+def scheduler():
+    import time
 
-    print("Database updated.")
-    conn.commit()
-    conn.close() 
+    SECONDS_PER_DAY = 24 * 60 * 60
+    print("Starting daily scheduler...")
+    while True:
+        try:
+            update_db()  # your "check LDA filings and update DB + Slack" logic
+        except Exception as e:
+            print(f"Daily update failed: {e}", flush=True)
 
-# Update the database with new LDA filings
-def update_db(): 
-    
+        time.sleep(SECONDS_PER_DAY)
 
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False) 
-    c = conn.cursor()
+@slack_event_adapter.on('app_mention')
+def handle_mention(payload):
+    print("App mention received.") 
+    event = payload.get('event', {})
+    # print(event)
+    user = event.get('user')
+    channel = event.get('channel') 
+    text = event.get('text', '')
+    cleaned = sub(r'<@[^>]+>', '', text).strip().lower()
 
-    # delete 10 rows for testing:
-    c.execute("DELETE FROM filings WHERE filing_uuid IN (SELECT filing_uuid FROM filings LIMIT 100)")
-
-    # Preload seen IDs or start fresh if table missing
-    try:
-        c.execute("SELECT filing_uuid FROM filings")
-        seen_ids = {row[0] for row in c.fetchall()} 
-    except Exception as e:
-        seen_ids = set()
-    print(f"Seen IDs loaded: {len(seen_ids)}")
-
-    try:
-        call = fetch_all_filings() # update  
-    except Exception as e:
-        print("Error fetching filings:", e)
+    if 'post' not in cleaned:
         return
 
-    print("Fetched filings:", len(call))
+    # Acknowledge
+    try:
+        client.chat_postEphemeral(
+            channel=channel,
+            user=user,
+            text="Working on compiling the CSV — I'll post it to the channel when ready."
+        )
+    except Exception as e:
+        print(f"Error sending ephemeral ack: {e}")
 
-    # Process each filing, checking if it's already in the database    
-    posts = [] 
-    for filing in call: 
-        uuid = get_uuid(filing)
-        # print("Processing filing UUID:", uuid)
-        if uuid in seen_ids:
-            continue
-        else: 
-            try: 
-                filing_data =  {
-                "filing_uuid": get_uuid(filing),
-                "filing_year": get_filing_year(filing),
-                "filing_period": get_filing_period(filing),
-                "registrant_name": get_registrant_name(filing),
-                "client_name": get_client_name(filing),
-                "lobbying_descriptions": get_lobbying_descriptions(filing),
-                "income": get_income(filing),
-                "expenses": get_expenses(filing),
-                "filing_document_url": get_filing_document_url(filing),
-                "lobbyist_names": get_lobbyist_names(filing),
-            }
-                save_filing_to_db(filing_data) 
-                print(f"Saved filing {uuid} to database.")
-                if should_post(filing_data) == True:
-                    posts.append(filing_data)  # add to post_slack
-                seen_ids.add(uuid)
-            except Exception as e:
-                print(f"Error processing filing {uuid}: {e}")
-                continue
+    filing_period = fetch_quarter()
+    year = THIS_YEAR
 
-    if posts:
-        for filing_data in posts:
-            post_slack(filing_data)
-    
-    else:
-        post_slack()
+    # Query DB for current period
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """SELECT registrant_name, client_name, filing_document_url,  lobbying_descriptions, 
+                    lobbyist_names, income, expenses, filing_period, filing_year
+               FROM filings
+               WHERE filing_period = ? AND filing_year = ?  
+            """,
+            (filing_period, year),
+        )
+        rows = c.fetchall()
+    except Exception as e:
+        print(f"Error querying DB for CSV in handler: {e}")
+        rows = []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not rows:
+        try:
+            client.chat_postEphemeral(
+                channel=channel,
+                user=user,
+                text=f"No filings found for {filing_period} {year}."
+            )
+        except Exception as e:
+            print(f"Error sending ephemeral no-results message: {e}")
+        return
+
+    # Build CSV content
+    sio = io.StringIO()
+    writer = csv.writer(sio)
+    header = [
+        "registrant_name",
+        "client_name",
+        "filing_document_url", 
+        "income",
+        "expenses",
+        "lobbying_descriptions",
+        "lobbyist_names",
+        "filing_period",
+        "filing_year", 
+    ]
+    writer.writerow(header)
+    for row in rows:
+        cleaned_row = ["" if v is None else v for v in row]
+        writer.writerow(cleaned_row)
+    csv_content = sio.getvalue()
+    sio.close()
+
+    filename = f"lda_filings_{filing_period}_{year}.csv"
+
+    # Step 1: Get the external upload URL
+    try:
+        upload_url_response = client.files_getUploadURLExternal(
+            token= os.environ.get('SLACK_TOKEN'), 
+            filename=filename,
+            length=len(csv_content)
+        )
+        upload_url = upload_url_response['upload_url']
+        file_id = upload_url_response['file_id'] 
+    except Exception as e:
+        print(f"Error getting external upload URL: {e}")
+        return
+
+    try:
+        file_bytes = csv_content.encode('utf-8')
+
+        # Step 2: Upload the file content to the external URL
+        response = requests.post(upload_url, files={"file": (filename, io.BytesIO(file_bytes))}) 
         
-        
-def should_post(filing_data: dict) -> bool:
-    income = filing_data.get("income")
-    expenses = filing_data.get("expenses")
+    except Exception as e:
+        print(f"Error uploading file to URL: {e}")
+        return None
 
-    if income is None and expenses is None:
-        return False
+    try:
+        complete_response = client.files_completeUploadExternal(
+            token= os.environ.get('SLACK_TOKEN'), 
+            files=[{"id":file_id, "title":filename}],
+            channel_id= channel
+        )
+        try:
+            client.chat_postEphemeral(
+                channel=channel,
+                user=user,
+                text=f"Uploaded CSV for {filing_period} {year} to {SLACK_CHANNEL}"
+            )
+        except Exception as e:
+            print(f"Error sending ephemeral confirmation: {e}")
+    except Exception as e:
+        print(f"Error completing file upload: {e}")
+
+
+@app.route('/slack/events', methods=['POST'])
+def slack_events():
+    if request.method == 'POST':
+        data = request.json
+        # Check for the challenge token
+        if "challenge" in data:
+            return jsonify({"challenge": data["challenge"]}) 
+        slack_event_adapter.handle(request)
+        return '', 200
     
-    description = filing_data.get("lobbying_descriptions")
-    client = (filing_data.get("client_name")).lower()
-    registrant = (filing_data.get("registrant_name")).lower()
-
-    print(description, client, registrant)
-    tech_terms = ("tech", "technology", "technologies", "privacy", "data", "cybersecurity", "social media", "internet", "ai", "artificial intelligence", "cloud computing", "software", "semiconductor", "e-commerce", "digital advertising", "smartphone")
-    big_tech = ("amazon", "google", "meta", "facebook", "apple", "microsoft", "twitter", "tesla", "netflix", "ibm", "oracle", "intel", "nvidia")
-
-    # Check if any keyword appears in the relevant field
-    if (
-        any(term in description for term in tech_terms)
-        or any(term in client for term in big_tech)
-        or any(term in registrant for term in big_tech)
-    ):
-        print("Posting filing for client:", filing_data.get("client_name"))
-        return True
-    print("Skipping filing for client:", filing_data.get("client_name"))
-    return False
-
-# save to database
-def save_filing_to_db(filing_data: dict):
-    """Insert or replace a filing record in the database."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False) 
-    c = conn.cursor()
-    c.execute("""
-        INSERT OR REPLACE INTO filings
-        (filing_uuid, filing_document_url, filing_year, filing_period, registrant_name, client_name, 
-            income, expenses, lobbying_descriptions, lobbyist_names)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        filing_data["filing_uuid"],
-        filing_data["filing_document_url"],
-        filing_data["filing_year"],
-        filing_data["filing_period"],
-        filing_data["registrant_name"],
-        filing_data["client_name"],
-        filing_data["income"],
-        filing_data["expenses"],
-        filing_data["lobbying_descriptions"],
-        filing_data["lobbyist_names"],
-    ))
-    conn.commit()
-    conn.close()
-
-
+    
 if __name__ == '__main__':
-    main() 
+    initialize_db()
+    app.run(host='0.0.0.0', port=8080, debug=True)
+    scheduler() 
      
 
     

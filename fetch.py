@@ -49,7 +49,6 @@ def fetch_quarter():
       Jul 21, 2025 < d <= Oct 20, 2025  -> third_quarter
       Oct 20, 2025 < d <= Jan 20, 2026  -> fourth_quarter
 
-    Returns None if 'today' is outside the covered range.
     """
     today = datetime.now(ZoneInfo("America/New_York")).date()
     print(today)
