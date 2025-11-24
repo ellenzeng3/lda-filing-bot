@@ -2,6 +2,8 @@ import sqlite3
 from extract import get_uuid, get_filing_year, get_filing_document_url, get_filing_period, get_registrant_name, get_client_name, get_income, get_expenses, get_lobbying_descriptions, get_lobbyist_names
 from fetch import fetch_all_filings
 import os as _os
+import re
+from difflib import SequenceMatcher
 from pathlib import Path
 DB_PATH = _os.getenv("DATABASE_PATH", "filings.db")
 
@@ -13,6 +15,10 @@ def initialize_db():
         )
         
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+
+    # delete existing table 
+    # conn.execute("DROP TABLE IF EXISTS filings")
+
     with conn: 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS filings (
@@ -25,13 +31,14 @@ def initialize_db():
                 income REAL,
                 expenses REAL,
                 lobbying_descriptions TEXT,
-                lobbyist_names TEXT
+                lobbyist_names TEXT,
+                relevant TEXT
             )
         """) 
 
-    print("Database created.")
+    print("Database created/updated.")
     conn.commit()
-    conn.close() 
+    conn.close()
 
 # Update the database with new LDA filings
 def update_db(): 
@@ -47,7 +54,9 @@ def update_db():
     print(f"Seen IDs loaded: {len(seen_ids)}")
 
     try:
-        call = fetch_all_filings() # update  
+        # Pass seen_ids so fetch_all_filings can stop paging once it reaches
+        # filings we've already processed 
+        call = fetch_all_filings(seen_ids=seen_ids)
     except Exception as e:
         print("Error fetching filings:", e)
         return
@@ -59,11 +68,11 @@ def update_db():
     num_new = 0
     for filing in call: 
         uuid = get_uuid(filing)
-        # print("Processing filing UUID:", uuid)
         if uuid in seen_ids:
-            continue
+            break # assuming filings are in reverse chronological order
         else: 
             num_new += 1
+            seen_ids.add(uuid)
             try: 
                 filing_data =  {
                 "filing_uuid": get_uuid(filing),
@@ -77,11 +86,18 @@ def update_db():
                 "filing_document_url": get_filing_document_url(filing),
                 "lobbyist_names": get_lobbyist_names(filing),
             }
+                # Determine relevance 
+                relevance = is_relevant(filing_data)
+                filing_data['relevant'] = 'yes' if relevance else 'no'
+                print("Saving client:", filing_data["client_name"])
                 save_filing_to_db(conn, filing_data) 
-                print(f"Saved filing {uuid} to database.")
-                if should_post(filing_data) == True:
+
+                if filing_data["income"] is None and filing_data["expenses"] is None:
+                    pass 
+                else:
+                    print("Posting client:", filing_data["client_name"])
                     posts.append(filing_data)  # add to post_slack
-                seen_ids.add(uuid)
+
             except Exception as e:
                 print(f"Error processing filing {uuid}: {e}")
                 continue
@@ -90,55 +106,69 @@ def update_db():
     
     # Import post_slack lazily to avoid circular imports with post.py
     try:
-        from post import post_slack
+        from post import post_slack, post_done
     except Exception:
         post_slack = None
 
     if posts:
         for filing_data in posts:
             if post_slack:
-                post_slack(filing_data)
+                post_slack(filing_data) 
     else:
-        print("posting 'No new tech-related filings to post'.")
-        if post_slack:
-            post_slack(None)
+        print("No new relevant filings to post.")
 
 
-def should_post(filing_data: dict) -> bool:
-    income = filing_data.get("income")
-    expenses = filing_data.get("expenses")
+def is_relevant(filing_data: dict) -> bool: 
+    description = (filing_data.get("lobbying_descriptions") or "").lower()
+    client = (filing_data.get("client_name") or "").lower()
+    registrant = (filing_data.get("registrant_name") or "").lower()
+ 
+    tech_terms = (
+        "tech", "technology", "technologies", "privacy", "data", "data protection",
+        "cybersecurity", "social media", "internet", "ai",  
+        "artificial intelligence", "platform", "gdpr"
+    )
 
-    if income is None and expenses is None:
-        return False
-    
-    description = filing_data.get("lobbying_descriptions")
-    client = (filing_data.get("client_name")).lower()
-    registrant = (filing_data.get("registrant_name")).lower()
+    big_tech = (
+        "amazon", "google", "meta", "facebook", "apple", "microsoft", "twitter",
+        "tesla", "netflix", "ibm", "oracle", "intel", "nvidia", "databricks"
+    )
 
-    print(description, client, registrant)
-    tech_terms = ("tech", "technology", "technologies", "privacy", "data", "cybersecurity", "social media", "internet", "ai", "artificial intelligence", "cloud computing", "software", "semiconductor", "e-commerce", "digital advertising", "smartphone")
-    big_tech = ("amazon", "google", "meta", "facebook", "apple", "microsoft", "twitter", "tesla", "netflix", "ibm", "oracle", "intel", "nvidia")
+    def normalize_name(s: str) -> str:
+        s = (s or "").lower()
+        # Remove common 'doing business as' patterns
+        s = re.sub(r"\b(d/b/a|dba|doing business as)\b", "", s)
+        # Remove punctuation
+        s = re.sub(r"[^a-z0-9\s]", " ", s)
+        # Remove common corporate suffixes
+        s = re.sub(r"\b(inc|incorporated|llc|l\.l\.c|ltd|corp|corporation|co|llp|plc|gmbh|sa)\b", "", s)
+        # Collapse whitespace
+        s = re.sub(r"\s+", " ", s).strip()
+        # print(s)
+        return s
 
-    # Check if any keyword appears in the relevant field
+    norm_client = normalize_name(client)
+    norm_registrant = normalize_name(registrant) 
+
     if (
         any(term in description for term in tech_terms)
-        or any(term in client for term in big_tech)
-        or any(term in registrant for term in big_tech)
+        or any(term in norm_client for term in big_tech)
+        or any(term in norm_registrant for term in big_tech)
     ):
         print("Posting filing for client:", filing_data.get("client_name"))
         return True
     print("Skipping filing for client:", filing_data.get("client_name"))
-    return False
 
-# save to database
+    return False
+ 
 def save_filing_to_db(conn, filing_data: dict):
     """Insert or replace a filing record in the database."""
     c = conn.cursor()
     c.execute("""
         INSERT OR REPLACE INTO filings
         (filing_uuid, filing_document_url, filing_year, filing_period, registrant_name, client_name, 
-            income, expenses, lobbying_descriptions, lobbyist_names)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            income, expenses, lobbying_descriptions, lobbyist_names, relevant)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         filing_data["filing_uuid"],
         filing_data["filing_document_url"],
@@ -150,6 +180,7 @@ def save_filing_to_db(conn, filing_data: dict):
         filing_data["expenses"],
         filing_data["lobbying_descriptions"],
         filing_data["lobbyist_names"],
+        filing_data["relevant"],
     ))
     conn.commit()
 

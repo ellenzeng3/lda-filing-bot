@@ -3,14 +3,16 @@ from slack_sdk import WebClient
 from pathlib import Path
 from dotenv import load_dotenv
 from flask import Flask 
+from json import loads
 from slackeventsapi import SlackEventAdapter
 import os 
-from fetch import fetch_all_filings, fetch_filing, fetch_quarter, THIS_YEAR
+from multiprocessing import Process
+from fetch import fetch_quarter, THIS_YEAR
 from slack_sdk import WebClient
 from slackeventsapi import SlackEventAdapter
 from dotenv import load_dotenv
 from pathlib import Path as _Path
-from flask import request, jsonify, Flask as _Flask
+from flask import Flask as _Flask, make_response, request
 import requests
 import io, csv
 from re import sub 
@@ -19,76 +21,97 @@ from db_actions import update_db, initialize_db
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 DB_PATH = os.getenv("DATABASE_PATH", "/app/data/filings.db")
-
-# Slack app setup (used for app_mention handler)
 env_path = _Path('.') / '.env'
 load_dotenv(dotenv_path=env_path)
 app = _Flask(__name__)
 slack_event_adapter = SlackEventAdapter(os.environ.get('SIGNING_SECRET', ''), '/slack/events', app)
 client = WebClient(token=os.environ.get('SLACK_TOKEN'))
-SLACK_CHANNEL = os.getenv('SLACK_CHANNEL', '#lda-filings')
+CHANNEL = "#private-test-channel"
 
-
-def scheduler():
-    import time
-
-    SECONDS_PER_DAY = 24 * 60 * 60
-    print("Starting daily scheduler...")
-    while True:
-        try:
-            update_db()  # your "check LDA filings and update DB + Slack" logic
-        except Exception as e:
-            print(f"Daily update failed: {e}", flush=True)
-
-        time.sleep(SECONDS_PER_DAY)
+# Ensure DB is initialized when the app module is imported by Gunicorn/Flask CLI
+try:
+    initialize_db()
+except Exception as e:
+    print(f"Warning: initialize_db() raised an exception at import time: {e}")
 
 @slack_event_adapter.on('app_mention')
 def handle_mention(payload):
-    print("App mention received.") 
-    event = payload.get('event', {})
-    # print(event)
+    print("Mention received")
+    event = payload.get('event', {}) 
     user = event.get('user')
     channel = event.get('channel') 
     text = event.get('text', '')
     cleaned = sub(r'<@[^>]+>', '', text).strip().lower()
 
+    # return if no 'post' command
     if 'post' not in cleaned:
-        return
-
-    # Acknowledge
-    try:
-        client.chat_postEphemeral(
+        return client.chat_postEphemeral(
             channel=channel,
             user=user,
-            text="Working on compiling the CSV — I'll post it to the channel when ready."
-        )
-    except Exception as e:
-        print(f"Error sending ephemeral ack: {e}")
+            text="To post relevant filings, use '@LDAFilingBot post'. To post all filings, use '@LDAFilingBot post all'."
+        ) 
+    
+    # 'post all': posting all filings from quarter
+    if 'all' in cleaned:
+        p = Process(target=compile_filings, args=(payload, 'all'), daemon=True)
+    
+    # 'post': posting only relevant filings from quarter
+    else: 
+        p = Process(target=compile_filings, args=(payload, 'post'), daemon=True)
+        p.start()
+    
+    return make_response("", 200)
 
+def compile_filings(payload, type):
+    event = payload.get('event', {}) 
+    user = event.get('user')
+    channel = event.get('channel') 
     filing_period = fetch_quarter()
     year = THIS_YEAR
+    
+    # Ensure DB is updated before posting
+    update_db()
 
-    # Query DB for current period
-    try:
+    # if 'all' command, post all data
+    if type == 'all': 
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute(
             """SELECT registrant_name, client_name, filing_document_url,  lobbying_descriptions, 
-                    lobbyist_names, income, expenses, filing_period, filing_year
+                    lobbyist_names, income, expenses, filing_period, filing_year, relevant
                FROM filings
-               WHERE filing_period = ? AND filing_year = ?  
+               WHERE filing_period = ? AND filing_year = ? 
             """,
             (filing_period, year),
         )
         rows = c.fetchall()
-    except Exception as e:
-        print(f"Error querying DB for CSV in handler: {e}")
-        rows = []
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+
+        client.chat_postEphemeral(
+            channel=channel,
+            user=user,
+            text="Posting all filings from this quarter. For only relevant filings use '@LDAFilingBot post'."
+        )
+
+    # if no 'all' command, post only relevant data
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """SELECT registrant_name, client_name, filing_document_url,  lobbying_descriptions, 
+                    lobbyist_names, income, expenses, filing_period, filing_year, relevant
+               FROM filings
+               WHERE filing_period = ? AND filing_year = ?  AND relevant = 'yes'
+            """,
+            (filing_period, year),
+        )
+        rows = c.fetchall()
+        client.chat_postEphemeral(
+            channel=channel,
+            user=user,
+            text="Posting relevant filings from this quarter. For all filings use '@LDAFilingBot post all'."
+        )
+
+    conn.close()   
 
     if not rows:
         try:
@@ -104,16 +127,20 @@ def handle_mention(payload):
     # Build CSV content
     sio = io.StringIO()
     writer = csv.writer(sio)
+
+    # registrant_name, client_name, filing_document_url,  lobbying_descriptions, 
+                #    lobbyist_names, income, expenses, filing_period, filing_year, relevant
     header = [
         "registrant_name",
         "client_name",
         "filing_document_url", 
-        "income",
-        "expenses",
         "lobbying_descriptions",
         "lobbyist_names",
+        "income",
+        "expenses", 
         "filing_period",
         "filing_year", 
+        "relevant"
     ]
     writer.writerow(header)
     for row in rows:
@@ -124,7 +151,7 @@ def handle_mention(payload):
 
     filename = f"lda_filings_{filing_period}_{year}.csv"
 
-    # Step 1: Get the external upload URL
+    # Get the external upload URL
     try:
         upload_url_response = client.files_getUploadURLExternal(
             token= os.environ.get('SLACK_TOKEN'), 
@@ -140,7 +167,7 @@ def handle_mention(payload):
     try:
         file_bytes = csv_content.encode('utf-8')
 
-        # Step 2: Upload the file content to the external URL
+    # Upload the file content to the external URL
         response = requests.post(upload_url, files={"file": (filename, io.BytesIO(file_bytes))}) 
         
     except Exception as e:
@@ -152,34 +179,14 @@ def handle_mention(payload):
             token= os.environ.get('SLACK_TOKEN'), 
             files=[{"id":file_id, "title":filename}],
             channel_id= channel
-        )
-        try:
-            client.chat_postEphemeral(
-                channel=channel,
-                user=user,
-                text=f"Uploaded CSV for {filing_period} {year} to {SLACK_CHANNEL}"
-            )
-        except Exception as e:
-            print(f"Error sending ephemeral confirmation: {e}")
+        ) 
     except Exception as e:
         print(f"Error completing file upload: {e}")
 
+    
 
-@app.route('/slack/events', methods=['POST'])
-def slack_events():
-    if request.method == 'POST':
-        data = request.json
-        # Check for the challenge token
-        if "challenge" in data:
-            return jsonify({"challenge": data["challenge"]}) 
-        slack_event_adapter.handle(request)
-        return '', 200
-    
-    
-if __name__ == '__main__':
-    initialize_db()
-    app.run(host='0.0.0.0', port=8080, debug=True)
-    scheduler() 
+if __name__ == '__main__': 
+    app.run( port=8080, debug=True) 
      
 
     

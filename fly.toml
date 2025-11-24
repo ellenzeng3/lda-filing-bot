@@ -1,17 +1,13 @@
 app = "lda-bot"
 primary_region = "iad"
-
-[build]
-  dockerfile = "Dockerfile"
-
+ 
 [mounts]
   source      = "filings_db"   # created with `fly volumes create`
   destination = "/app/data"
 
 [env]
   DATABASE_PATH = "/app/data/filings.db"
-
-# Keep at least one machine running for 'app'
+ 
 [http_service]
   internal_port = 8080
   force_https = true
@@ -21,7 +17,6 @@ primary_region = "iad"
   processes = ['app']
 
 [[vm]]
-  # dedicated machine for long-running `app` process
   memory = "512mb"
   cpu_kind = "shared"
   cpus = 1

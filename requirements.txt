@@ -4,3 +4,4 @@ Requests==2.32.5
 slack_sdk==3.35.0
 slackeventsapi==3.0.3
 urllib3==2.5.0
+holidays==0.85
